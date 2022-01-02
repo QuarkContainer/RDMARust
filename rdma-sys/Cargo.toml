@@ -1,0 +1,19 @@
+[package]
+name = "rdma-sys"
+version = "0.1.0"
+authors = ["Qingming Qu <quqingming@gmail.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+build = "build.rs"
+links = "ibverbs"
+
+exclude = ["vendor/rdma-core/build/"]
+
+[dependencies]
+libc = "0.2"
+memoffset = "0.6"
+
+[build-dependencies]
+bindgen = "0.59"
