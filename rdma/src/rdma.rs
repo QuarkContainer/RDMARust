@@ -1,10 +1,12 @@
 use core::ops::Deref;
 use rdmaffi;
-use spin::Mutex;
+use std::error::Error;
+//use spin::Mutex;
 use std::convert::TryInto;
 use std::ptr;
+use std::sync::Mutex;
 
-use super::super::super::qlib::common::*;
+//use super::super::super::qlib::common::*;
 
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
@@ -118,7 +120,7 @@ impl IBContext {
             panic!("Failed to open IB device error");
         }
 
-        info!("ibv_open_device succeeded");
+        //info!("ibv_open_device succeeded");
         /* We are now done with device list, free it */
         unsafe { rdmaffi::ibv_free_device_list(device_list) };
 
@@ -344,7 +346,7 @@ impl RDMAContext {
         return context.gid;
     }
 
-    pub fn CreateQueuePair(&self) -> Result<QueuePair> {
+    pub fn CreateQueuePair(&self) -> Result<QueuePair, Error> {
         let context = self.lock();
         //create queue pair
         let mut qp_init_attr = rdmaffi::ibv_qp_init_attr {

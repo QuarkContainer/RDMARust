@@ -5,6 +5,14 @@ use std::env;
 use std::io::Error;
 use std::mem;
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static MSG: &str = "SEND operation ";
+static MSG_SIZE: usize = MSG.len();
+static RDMAMSGR: &str = "RDMA read operation ";
+static RDMAMSGW: &str = "RDMA write operation";
+
+// #define MSG_SIZE (strlen(MSG) + 1)
 
 struct CMConData {
     addr: u64,     /* Buffer address */
@@ -38,7 +46,7 @@ struct RDMAContext<'a> {
     completion_queue: *mut rdmaffi::ibv_cq, /* CQ handle */
     queue_pair: *mut rdmaffi::ibv_qp,      /* QP handle */
     memory_region: *mut rdmaffi::ibv_mr,   /* MR handle for buf */
-    buffer: Vec<u32>,
+    buffer: Vec<u8>,
     buffer_size: u32,
     sockfd: i32,
     ib_port: u8,
@@ -157,9 +165,9 @@ impl RDMAContext<'_> {
 
         // create memory region
         // TODO: should confirm size difference between C and Rust
-        let size = "Send operation ".len();
+        let size = MSG_SIZE;
         let mut data = Vec::with_capacity(size);
-        data.resize(size, u32::default());
+        data.resize(size, u8::default());
         let access = rdmaffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | rdmaffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | rdmaffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
@@ -612,15 +620,142 @@ fn connect_qp(context: &RDMAContext) -> i32 {
     rc
 }
 
-fn post_send(context: &RDMAContext, opcode: i32) -> i32 {
+fn post_send(context: &RDMAContext, opcode: u32) -> i32 {
     let mut sge = rdmaffi::ibv_sge {
-        addr: &context.buffer as *const _ as u64,
+        addr: &context.buffer[0] as *const _ as u64,
         length: context.buffer_size,
         lkey: unsafe { (*(context.memory_region)).lkey },
     };
 
+    let mut sw = rdmaffi::ibv_send_wr {
+        wr_id: 0,
+        next: ptr::null_mut(),
+        sg_list: &mut sge,
+        num_sge: 1,
+        opcode: opcode,
+        send_flags: rdmaffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+        imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t { imm_data: 0 }, //TODO: need double check
+        qp_type: rdmaffi::qp_type_t {
+            xrc: rdmaffi::xrc_t { remote_srqn: 0 },
+        },
+        wr: rdmaffi::wr_t {
+            rdma: rdmaffi::rdma_t {
+                //TODO: this is not needed when opcode is IBV_WR_SEND
+                remote_addr: context.remote_props.addr,
+                rkey: context.remote_props.rkey,
+            },
+        },
+        bind_mw_tso_union: rdmaffi::bind_mw_tso_union_t {
+            //TODO: need a better init solution
+            tso: rdmaffi::tso_t {
+                hdr: ptr::null_mut(),
+                hdr_sz: 0,
+                mss: 0,
+            },
+        },
+    };
+
+    let mut bad_wr: *mut rdmaffi::ibv_send_wr = ptr::null_mut();
+
+    let rc = unsafe { rdmaffi::ibv_post_send(context.queue_pair, &mut sw, &mut bad_wr) };
+
+    if rc != 0 {
+        println!("failed to post SR\n");
+    } else {
+        if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_SEND {
+            println!("Send Request was posted");
+        } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_READ {
+            println!("RDMA Read Request was posted");
+        } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE {
+            println!("RDMA Write Request was posted");
+        } else {
+            println!("Unknown Request was posted");
+        }
+    }
+
     //TODO: incomplete
-    1
+    rc
+}
+
+fn post_receive(context: &RDMAContext) -> i32 {
+    let mut sge = rdmaffi::ibv_sge {
+        addr: &context.buffer[0] as *const _ as u64,
+        length: context.buffer_size,
+        lkey: unsafe { (*(context.memory_region)).lkey },
+    };
+
+    let mut rw = rdmaffi::ibv_recv_wr {
+        wr_id: 0,
+        next: ptr::null_mut(),
+        sg_list: &mut sge,
+        num_sge: 1,
+    };
+
+    let mut bad_wr: *mut rdmaffi::ibv_recv_wr = ptr::null_mut();
+
+    let rc = unsafe { rdmaffi::ibv_post_recv(context.queue_pair, &mut rw, &mut bad_wr) };
+
+    if rc != 0 {
+        println!("failed to post RR\n");
+    } else {
+        println!("Receive Request was posted\n");
+    }
+
+    rc
+}
+
+fn poll_completion(context: &RDMAContext) -> i32 {
+    let mut wc = rdmaffi::ibv_wc {
+        //TODO: find a better way to initialize
+        wr_id: 0,
+        status: rdmaffi::ibv_wc_status::IBV_WC_SUCCESS,
+        opcode: rdmaffi::ibv_wc_opcode::IBV_WC_BIND_MW,
+        vendor_err: 0,
+        byte_len: 0,
+        imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t { imm_data: 0 }, //TODO: need double check
+        qp_num: 0,
+        src_qp: 0,
+        wc_flags: 0,
+        pkey_index: 0,
+        slid: 0,
+        sl: 0,
+        dlid_path_bits: 0,
+    };
+
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time Error")
+        .as_millis();
+    let mut poll_result = 0;
+    loop {
+        poll_result = unsafe { rdmaffi::ibv_poll_cq(context.completion_queue, 1, &mut wc) };
+        let cur_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time Error")
+            .as_millis();
+        if (poll_result != 0 || cur_time - start_time >= 2000) {
+            break;
+        }
+    }
+
+    let mut rc = 0;
+    if poll_result < 0 {
+        println!("poll CQ failed");
+        rc = 1
+    } else if poll_result == 0 {
+        println!("completion wasn't found in the CQ after timeout")
+    } else {
+        println!("completion was found in CQ with status {}", wc.status);
+        if (wc.status != rdmaffi::ibv_wc_status::IBV_WC_SUCCESS) {
+            println!(
+                "got bad completion with status: {}, vendor syndrome: {}",
+                wc.status, wc.vendor_err
+            );
+            rc = 1
+        }
+    }
+
+    rc
 }
 
 // use socket to sync data.
@@ -713,5 +848,16 @@ fn main() {
 
         // create resources
         let sock: i32 = -1;
+        let is_client = !servername.is_empty();
+        let rdma_context = RDMAContext::new("127.0.0.1", "");
+        if connect_qp(&rdma_context) != 0 {
+            println!("failed to connect qp");
+            //TODO: clean up
+        }
+
+        if is_client {
+            println!("Message is TODO");
+        } else {
+        }
     }
 }
