@@ -8,6 +8,10 @@ edition = "2021"
 name = "rqe"
 path = "examples/rdma_quark_example.rs"
 
+# [[bin]]
+# name = "se"
+# path = "examples/socketv2.rs"
+
 [lib]
 path = "src/rdma.rs"
 

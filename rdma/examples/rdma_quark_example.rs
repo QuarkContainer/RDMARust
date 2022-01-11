@@ -1,11 +1,12 @@
 use libc as c;
+use rdmaffi::rdma_destroy_ep;
 use std::io::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, mem, ptr};
 
 use rdma::*;
 
-static RDMA_PORT: u8 = 168;
+static RDMA_PORT: u8 = 1;
 static SOCK_PORT: u16 = 20226;
 static BUFFER: [u8; 256] = [0; 256];
 static BUFFER_SIZE: u16 = 256;
@@ -93,150 +94,6 @@ fn sock_sync_data(
     return rc;
 }
 
-fn post_send(
-    local_address: u64,
-    size: u32,
-    lkey: u32,
-    remote_address: u64,
-    rkey: u32,
-    opcode: u32,
-    queue_pair: QueuePair,
-) -> i32 {
-    let mut sge = rdmaffi::ibv_sge {
-        addr: local_address,
-        length: size,
-        lkey: lkey,
-    };
-
-    let mut sw = rdmaffi::ibv_send_wr {
-        wr_id: 0,
-        next: ptr::null_mut(),
-        sg_list: &mut sge,
-        num_sge: 1,
-        opcode: opcode,
-        send_flags: rdmaffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
-        imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t { imm_data: 0 }, //TODO: need double check
-        qp_type: rdmaffi::qp_type_t {
-            xrc: rdmaffi::xrc_t { remote_srqn: 0 },
-        },
-        wr: rdmaffi::wr_t {
-            rdma: rdmaffi::rdma_t {
-                //TODO: this is not needed when opcode is IBV_WR_SEND
-                remote_addr: remote_address,
-                rkey: rkey,
-            },
-        },
-        bind_mw_tso_union: rdmaffi::bind_mw_tso_union_t {
-            //TODO: need a better init solution
-            tso: rdmaffi::tso_t {
-                hdr: ptr::null_mut(),
-                hdr_sz: 0,
-                mss: 0,
-            },
-        },
-    };
-
-    let mut bad_wr: *mut rdmaffi::ibv_send_wr = ptr::null_mut();
-
-    let rc = unsafe { rdmaffi::ibv_post_send(queue_pair, &mut sw, &mut bad_wr) };
-
-    if rc != 0 {
-        println!("failed to post SR\n");
-    } else {
-        if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_SEND {
-            println!("Send Request was posted");
-        } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_READ {
-            println!("RDMA Read Request was posted");
-        } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE {
-            println!("RDMA Write Request was posted");
-        } else {
-            println!("Unknown Request was posted");
-        }
-    }
-    rc
-}
-
-fn post_receive(local_address: u64, size: u32, lkey: u32, queue_pair: QueuePair) -> i32 {
-    let mut sge = rdmaffi::ibv_sge {
-        addr: local_address,
-        length: size,
-        lkey: lkey,
-    };
-
-    let mut rw = rdmaffi::ibv_recv_wr {
-        wr_id: 0,
-        next: ptr::null_mut(),
-        sg_list: &mut sge,
-        num_sge: 1,
-    };
-
-    let mut bad_wr: *mut rdmaffi::ibv_recv_wr = ptr::null_mut();
-
-    let rc = unsafe { rdmaffi::ibv_post_recv(queue_pair.0, &mut rw, &mut bad_wr) };
-
-    if rc != 0 {
-        println!("failed to post RR\n");
-    } else {
-        println!("Receive Request was posted\n");
-    }
-
-    rc
-}
-
-fn poll_completion(context: &RDMAContext) -> i32 {
-    let mut wc = rdmaffi::ibv_wc {
-        //TODO: find a better way to initialize
-        wr_id: 0,
-        status: rdmaffi::ibv_wc_status::IBV_WC_SUCCESS,
-        opcode: rdmaffi::ibv_wc_opcode::IBV_WC_BIND_MW,
-        vendor_err: 0,
-        byte_len: 0,
-        imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t { imm_data: 0 }, //TODO: need double check
-        qp_num: 0,
-        src_qp: 0,
-        wc_flags: 0,
-        pkey_index: 0,
-        slid: 0,
-        sl: 0,
-        dlid_path_bits: 0,
-    };
-
-    let start_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time Error")
-        .as_millis();
-    let mut poll_result = 0;
-    loop {
-        poll_result = unsafe { rdmaffi::ibv_poll_cq(context.lock().completion_queue, 1, &mut wc) };
-        let cur_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time Error")
-            .as_millis();
-        if (poll_result != 0 || cur_time - start_time >= 2000) {
-            break;
-        }
-    }
-
-    let mut rc = 0;
-    if poll_result < 0 {
-        println!("poll CQ failed");
-        rc = 1
-    } else if poll_result == 0 {
-        println!("completion wasn't found in the CQ after timeout")
-    } else {
-        println!("completion was found in CQ with status {}", wc.status);
-        if (wc.status != rdmaffi::ibv_wc_status::IBV_WC_SUCCESS) {
-            println!(
-                "got bad completion with status: {}, vendor syndrome: {}",
-                wc.status, wc.vendor_err
-            );
-            rc = 1
-        }
-    }
-
-    rc
-}
-
 #[derive(Default)]
 struct QueuePairConnectInfo {
     qp_num: u32,
@@ -259,20 +116,75 @@ fn main() {
 
     // create resources
     let is_client = !servername.is_empty();
+    //socket_test(&servername);
+    rdma(&servername);
+}
 
+fn socket_test(server_name: &str) -> i32 {
+    let mut local_queue_pair_connect_info = QueuePairConnectInfo {
+        qp_num: 1,
+        lid: 2,
+        gid: Gid::default(),
+        addr: 4,
+        rkey: 5,
+    };
+
+    let mut remote_queue_pair_connect_info = QueuePairConnectInfo::default();
+    let sock = sock_connect(&server_name);
+
+    sock_sync_data(
+        sock,
+        mem::size_of::<QueuePairConnectInfo>(),
+        &mut local_queue_pair_connect_info as *mut _ as *mut c::c_void,
+        &mut remote_queue_pair_connect_info as *mut _ as *mut c::c_void,
+    );
+    println!(
+        "remote_queue_pair! qp_num: {}, lid: {}, addr: {}, rkey: {}",
+        local_queue_pair_connect_info.qp_num,
+        local_queue_pair_connect_info.lid,
+        local_queue_pair_connect_info.addr,
+        local_queue_pair_connect_info.rkey
+    );
+    unsafe { c::close(sock) };
+    1
+}
+
+fn rdma(server_name: &str) {
+    let sock = sock_connect(&server_name);
     let rdma_context = RDMAContext::default();
     rdma_context.Init("", RDMA_PORT);
     let queue_pair = rdma_context.CreateQueuePair().unwrap();
+
+    // let memory_region = rdma_context
+    //     .CreateMemoryRegion(BUFFER.as_ptr() as u64, 256)
+    //     .unwrap();
+
+    let n = 256;
+    let mut data = Vec::with_capacity(n);
+    data.resize(n, u32::default());
+    if server_name.is_empty() {
+        data[0] = 101;
+        data[1] = 102;
+        data[2] = 103;
+        data[3] = 104;
+    }
     let memory_region = rdma_context
-        .CreateMemoryRegion(BUFFER.as_ptr() as u64, 256)
+        .CreateMemoryRegion(data.as_mut_ptr() as *mut _ as u64, 256)
         .unwrap();
 
-    let sock = sock_connect(&servername);
+    // let mut local_queue_pair_connect_info = QueuePairConnectInfo {
+    //     qp_num: queue_pair.qpNum(),
+    //     lid: rdma_context.Lid(),
+    //     gid: rdma_context.Gid(),
+    //     addr: BUFFER.as_ptr() as u64,
+    //     rkey: memory_region.RKey(),
+    // };
+
     let mut local_queue_pair_connect_info = QueuePairConnectInfo {
         qp_num: queue_pair.qpNum(),
         lid: rdma_context.Lid(),
         gid: rdma_context.Gid(),
-        addr: BUFFER.as_ptr() as u64,
+        addr: data.as_mut_ptr() as *mut _ as u64,
         rkey: memory_region.RKey(),
     };
 
@@ -293,4 +205,54 @@ fn main() {
     );
 
     queue_pair.ToRts();
+    if !server_name.is_empty() {
+        println!(
+            "Before RDMA_READ: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+        queue_pair.post_send(
+            local_queue_pair_connect_info.addr,
+            16,
+            local_queue_pair_connect_info.rkey,
+            remote_queue_pair_connect_info.addr,
+            remote_queue_pair_connect_info.rkey,
+            rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
+        );
+
+        rdma_context.poll_completion();
+        println!(
+            "After RDMA_READ: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+
+        data[0] = 11;
+        data[1] = 12;
+        data[2] = 13;
+        data[3] = 14;
+
+        queue_pair.post_send(
+            local_queue_pair_connect_info.addr,
+            16,
+            local_queue_pair_connect_info.rkey,
+            remote_queue_pair_connect_info.addr,
+            remote_queue_pair_connect_info.rkey,
+            rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+        );
+
+        rdma_context.poll_completion();
+    }
+
+    sock_sync_data(
+        sock,
+        mem::size_of::<QueuePairConnectInfo>(),
+        &mut local_queue_pair_connect_info as *mut _ as *mut c::c_void,
+        &mut remote_queue_pair_connect_info as *mut _ as *mut c::c_void,
+    );
+
+    if server_name.is_empty() {
+        println!(
+            "After RDMA_WRITE: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+    }
 }

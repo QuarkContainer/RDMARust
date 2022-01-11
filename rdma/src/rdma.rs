@@ -1,13 +1,12 @@
 use core::ops::Deref;
 use rdmaffi;
 //use std::error::Error;
-use std::io::Error;
-//use spin::Mutex;
-use c::syscall;
 use libc as c;
 use spin::Mutex;
 use std::convert::TryInto;
+use std::io::Error;
 use std::ptr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 //use super::super::super::qlib::common::*;
 
@@ -161,7 +160,11 @@ impl IBContext {
         /* query port properties */
         if unsafe { rdmaffi::___ibv_query_port(self.0, ibPort, &mut port_attr) } != 0 {
             // TODO: cleanup
-            panic!("___ibv_query_port on port {} failed\n", ibPort);
+            panic!(
+                "___ibv_query_port on port {} failed, last os error: {}",
+                ibPort,
+                Error::last_os_error()
+            );
         }
 
         return PortAttr(port_attr);
@@ -398,6 +401,7 @@ impl RDMAContext {
             | rdmaffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
             | rdmaffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
 
+        println!("addr is {}", addr);
         let mr = unsafe {
             rdmaffi::ibv_reg_mr(
                 context.protectDomain.0,
@@ -445,6 +449,62 @@ impl RDMAContext {
             }
         }
         0
+    }
+
+    pub fn poll_completion(&self) -> i32 {
+        let mut wc = rdmaffi::ibv_wc {
+            //TODO: find a better way to initialize
+            wr_id: 0,
+            status: rdmaffi::ibv_wc_status::IBV_WC_SUCCESS,
+            opcode: rdmaffi::ibv_wc_opcode::IBV_WC_BIND_MW,
+            vendor_err: 0,
+            byte_len: 0,
+            imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t {
+                imm_data: 0,
+            }, //TODO: need double check
+            qp_num: 0,
+            src_qp: 0,
+            wc_flags: 0,
+            pkey_index: 0,
+            slid: 0,
+            sl: 0,
+            dlid_path_bits: 0,
+        };
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time Error")
+            .as_millis();
+        let mut poll_result = 0;
+        loop {
+            poll_result = unsafe { rdmaffi::ibv_poll_cq(self.CompleteQueue(), 1, &mut wc) };
+            let cur_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time Error")
+                .as_millis();
+            if (poll_result != 0 || cur_time - start_time >= 2000) {
+                break;
+            }
+        }
+
+        let mut rc = 0;
+        if poll_result < 0 {
+            println!("poll CQ failed");
+            rc = 1
+        } else if poll_result == 0 {
+            println!("completion wasn't found in the CQ after timeout")
+        } else {
+            println!("completion was found in CQ with status {}", wc.status);
+            if (wc.status != rdmaffi::ibv_wc_status::IBV_WC_SUCCESS) {
+                println!(
+                    "got bad completion with status: {}, vendor syndrome: {}",
+                    wc.status, wc.vendor_err
+                );
+                rc = 1
+            }
+        }
+
+        rc
     }
 
     // call back for
@@ -870,6 +930,98 @@ impl QueuePair {
             | rdmaffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
             | rdmaffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
         let rc = unsafe { rdmaffi::ibv_modify_qp(self.Data(), &mut attr, flags.0 as i32) };
+
+        rc
+    }
+
+    pub fn post_send(
+        &self,
+        local_address: u64,
+        size: u32,
+        lkey: u32,
+        remote_address: u64,
+        rkey: u32,
+        opcode: u32,
+    ) -> i32 {
+        let mut sge = rdmaffi::ibv_sge {
+            addr: local_address,
+            length: size,
+            lkey: lkey,
+        };
+
+        let mut sw = rdmaffi::ibv_send_wr {
+            wr_id: 0,
+            next: ptr::null_mut(),
+            sg_list: &mut sge,
+            num_sge: 1,
+            opcode: opcode,
+            send_flags: rdmaffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            imm_data_invalidated_rkey_union: rdmaffi::imm_data_invalidated_rkey_union_t {
+                imm_data: 0,
+            }, //TODO: need double check
+            qp_type: rdmaffi::qp_type_t {
+                xrc: rdmaffi::xrc_t { remote_srqn: 0 },
+            },
+            wr: rdmaffi::wr_t {
+                rdma: rdmaffi::rdma_t {
+                    //TODO: this is not needed when opcode is IBV_WR_SEND
+                    remote_addr: remote_address,
+                    rkey: rkey,
+                },
+            },
+            bind_mw_tso_union: rdmaffi::bind_mw_tso_union_t {
+                //TODO: need a better init solution
+                tso: rdmaffi::tso_t {
+                    hdr: ptr::null_mut(),
+                    hdr_sz: 0,
+                    mss: 0,
+                },
+            },
+        };
+
+        let mut bad_wr: *mut rdmaffi::ibv_send_wr = ptr::null_mut();
+
+        let rc = unsafe { rdmaffi::ibv_post_send(self.Data(), &mut sw, &mut bad_wr) };
+
+        if rc != 0 {
+            println!("failed to post SR\n");
+        } else {
+            if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_SEND {
+                println!("Send Request was posted");
+            } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_READ {
+                println!("RDMA Read Request was posted");
+            } else if opcode == rdmaffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE {
+                println!("RDMA Write Request was posted");
+            } else {
+                println!("Unknown Request was posted");
+            }
+        }
+        rc
+    }
+
+    pub fn post_receive(&self, local_address: u64, size: u32, lkey: u32) -> i32 {
+        let mut sge = rdmaffi::ibv_sge {
+            addr: local_address,
+            length: size,
+            lkey: lkey,
+        };
+
+        let mut rw = rdmaffi::ibv_recv_wr {
+            wr_id: 0,
+            next: ptr::null_mut(),
+            sg_list: &mut sge,
+            num_sge: 1,
+        };
+
+        let mut bad_wr: *mut rdmaffi::ibv_recv_wr = ptr::null_mut();
+
+        let rc = unsafe { rdmaffi::ibv_post_recv(self.Data(), &mut rw, &mut bad_wr) };
+
+        if rc != 0 {
+            println!("failed to post RR\n");
+        } else {
+            println!("Receive Request was posted\n");
+        }
 
         rc
     }
