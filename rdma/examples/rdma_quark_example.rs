@@ -1,8 +1,9 @@
 use libc as c;
 use rdmaffi::rdma_destroy_ep;
 use std::io::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, mem, ptr};
+use std::mem::MaybeUninit;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, mem, ptr, thread};
 
 use rdma::*;
 
@@ -254,5 +255,120 @@ fn rdma(server_name: &str) {
             "After RDMA_WRITE: vec 0: {}, 1: {}, 2: {}, 3: {}",
             data[0], data[1], data[2], data[3]
         );
+    }
+
+    // let mut data1 = Vec::with_capacity(n);
+    // data1.resize(n, u32::default());
+    // Test write immediate
+    if server_name.is_empty() {
+        println!(
+            "Before RDMA_WRITE IMM: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+        //queue_pair.PostRecv(456);
+        queue_pair.post_receive(
+            456,
+            local_queue_pair_connect_info.addr,
+            0,
+            local_queue_pair_connect_info.rkey,
+        );
+
+        let mut raw_fd_set = unsafe { mem::MaybeUninit::<libc::fd_set>::uninit() };
+        unsafe { libc::FD_ZERO(raw_fd_set.as_mut_ptr()) };
+        let mut fd_set = unsafe { raw_fd_set.assume_init() };
+        let ccfd = rdma_context.CCFd();
+
+        unsafe {
+            libc::FD_SET(ccfd, &mut fd_set);
+            println!("before select 1...");
+            libc::select(
+                ccfd + 1,
+                &mut fd_set,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+        }
+
+        println!("after select 1...");
+
+        rdma_context.PollCompletion();
+        println!(
+            "After RDMA_WRITE IMM: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+
+        queue_pair.post_receive(
+            789,
+            local_queue_pair_connect_info.addr,
+            16,
+            local_queue_pair_connect_info.rkey,
+        );
+
+        println!("before select 2...");
+        unsafe {
+            libc::select(
+                ccfd + 1,
+                &mut fd_set,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+        }
+
+        println!("after select 2...");
+
+        rdma_context.PollCompletion();
+        println!(
+            "After RDMA_WRITE IMM: vec 0: {}, 1: {}, 2: {}, 3: {}",
+            data[0], data[1], data[2], data[3]
+        );
+    }
+
+    println!("came here 1111");
+
+    if !server_name.is_empty() {
+        // sock_sync_data(
+        //     sock,
+        //     mem::size_of::<QueuePairConnectInfo>(),
+        //     &mut local_queue_pair_connect_info as *mut _ as *mut c::c_void,
+        //     &mut remote_queue_pair_connect_info as *mut _ as *mut c::c_void,
+        // );
+        let wait_duration = Duration::from_secs(5);
+        thread::sleep(wait_duration);
+
+        data[0] = 201;
+        data[1] = 202;
+        data[2] = 203;
+        data[3] = 204;
+        queue_pair.WriteImm(
+            123,
+            local_queue_pair_connect_info.addr,
+            16,
+            local_queue_pair_connect_info.rkey,
+            remote_queue_pair_connect_info.addr,
+            remote_queue_pair_connect_info.rkey,
+            111789,
+        );
+        println!("came here 2222");
+        rdma_context.PollCompletion();
+
+        thread::sleep(wait_duration);
+
+        data[0] = 301;
+        data[1] = 302;
+        data[2] = 303;
+        data[3] = 304;
+        queue_pair.WriteImm(
+            888,
+            local_queue_pair_connect_info.addr,
+            16,
+            local_queue_pair_connect_info.rkey,
+            remote_queue_pair_connect_info.addr,
+            remote_queue_pair_connect_info.rkey,
+            222999,
+        );
+        println!("came here 2222");
+        rdma_context.PollCompletion();
     }
 }

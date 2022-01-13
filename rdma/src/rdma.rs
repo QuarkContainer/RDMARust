@@ -1,12 +1,12 @@
 use core::ops::Deref;
-use rdmaffi;
+use rdmaffi::{self, ibv_cq};
 //use std::error::Error;
 use libc as c;
 use spin::Mutex;
 use std::convert::TryInto;
 use std::io::Error;
-use std::ptr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{ptr, thread};
 
 //use super::super::super::qlib::common::*;
 
@@ -124,6 +124,53 @@ impl IBContext {
             panic!("Failed to open IB device error");
         }
 
+        let mut device_attr = rdmaffi::ibv_device_attr {
+            fw_ver: [0; 64],
+            node_guid: 0,
+            sys_image_guid: 0,
+            max_mr_size: 0,
+            page_size_cap: 0,
+            vendor_id: 0,
+            vendor_part_id: 0,
+            hw_ver: 0,
+            max_qp: 0,
+            max_qp_wr: 0,
+            device_cap_flags: 0,
+            max_sge: 0,
+            max_sge_rd: 0,
+            max_cq: 0,
+            max_cqe: 0,
+            max_mr: 0,
+            max_pd: 0,
+            max_qp_rd_atom: 0,
+            max_ee_init_rd_atom: 0,
+            max_res_rd_atom: 0,
+            max_ee_rd_atom: 0,
+            max_qp_init_rd_atom: 0,
+            atomic_cap: 0,
+            max_ee: 0,
+            max_rdd: 0,
+            max_mw: 0,
+            max_raw_ipv6_qp: 0,
+            max_raw_ethy_qp: 0,
+            max_mcast_grp: 0,
+            max_mcast_qp_attach: 0,
+            max_total_mcast_qp_attach: 0,
+            max_ah: 0,
+            max_fmr: 0,
+            max_map_per_fmr: 0,
+            max_srq: 0,
+            max_srq_sge: 0,
+            max_srq_wr: 0,
+            max_pkeys: 0,
+            local_ca_ack_delay: 0,
+            phys_port_cnt: 0,
+        };
+
+        unsafe { rdmaffi::ibv_query_device(context, &mut device_attr) };
+
+        println!("device attr: max_qp: {}", device_attr.max_qp);
+
         //info!("ibv_open_device succeeded");
         /* We are now done with device list, free it */
         unsafe { rdmaffi::ibv_free_device_list(device_list) };
@@ -186,6 +233,14 @@ impl IBContext {
             // TODO: cleanup
             panic!("ibv_create_comp_channel failed\n");
         }
+
+        let fd = unsafe { (*completionChannel).fd };
+
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
         return CompleteChannel(completionChannel);
     }
 
@@ -195,6 +250,13 @@ impl IBContext {
         if cq.is_null() {
             // TODO: cleanup
             panic!("ibv_create_cq failed\n");
+        }
+
+        unsafe {
+            rdmaffi::ibv_req_notify_cq(
+                cq, /* on which CQ */
+                0,  /* 0 = all event type, no filter*/
+            );
         }
 
         return CompleteQueue(cq);
@@ -394,6 +456,11 @@ impl RDMAContext {
         return Ok(QueuePair(Mutex::new(qp)));
     }
 
+    pub fn CCFd(&self) -> i32 {
+        let context = self.lock();
+        return context.ccfd;
+    }
+
     pub fn CreateMemoryRegion(&self, addr: u64, size: usize) -> Result<MemoryRegion, Error> {
         let context = self.lock();
         let access = rdmaffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
@@ -422,6 +489,10 @@ impl RDMAContext {
         return self.lock().completeQueue.0;
     }
 
+    pub fn CompleteChannel(&self) -> *mut rdmaffi::ibv_comp_channel {
+        return self.lock().completeChannel.0;
+    }
+
     pub fn PollCompletion(&self) -> i32 {
         let mut wc = rdmaffi::ibv_wc {
             //TODO: find a better way to initialize
@@ -443,12 +514,49 @@ impl RDMAContext {
         };
 
         loop {
+            unsafe {
+                println!("1 ibv_get_cq_event ****");
+                //let channel = self.lock().completeChannel.0;
+                println!("2 ibv_get_cq_event ****");
+                //let mut queue = self.CompleteQueue();
+                println!("3 before ibv_get_cq_event ****");
+                let mut cq_ptr: *mut rdmaffi::ibv_cq = ptr::null_mut();
+                let mut cq_context: *mut std::os::raw::c_void = ptr::null_mut();
+                rdmaffi::ibv_get_cq_event(
+                    self.CompleteChannel(),
+                    &mut cq_ptr, //&mut self.CompleteQueue(),
+                    &mut cq_context,
+                );
+                println!("4 before ibv_get_cq_event ****");
+            }
             let poll_result = unsafe { rdmaffi::ibv_poll_cq(self.CompleteQueue(), 1, &mut wc) };
             if poll_result > 0 {
+                println!("Got WC {}!", wc.wr_id);
+                unsafe {
+                    rdmaffi::ibv_req_notify_cq(
+                        self.CompleteQueue(), /* on which CQ */
+                        0,                    /* 0 = all event type, no filter*/
+                    );
+                }
+                unsafe {
+                    rdmaffi::ibv_ack_cq_events(
+                        self.CompleteQueue(), /* on which CQ */
+                        1,                    /* 0 = all event type, no filter*/
+                    );
+                }
                 self.ProcessWC(&wc);
+                break;
+            } else if poll_result == 0 {
+                println!("No WC!");
+                let sleep_duration = Duration::from_secs(1);
+                thread::sleep(sleep_duration);
+                // break;
+            } else {
+                println!("Error to query CQ!")
+                // break;
             }
         }
-        0
+        1
     }
 
     pub fn poll_completion(&self) -> i32 {
@@ -509,26 +617,37 @@ impl RDMAContext {
 
     // call back for
     pub fn ProcessWC(&self, wc: &rdmaffi::ibv_wc) {
-        let wrid = WorkRequestId(wc.wr_id);
-        let fd = wrid.Fd();
-        let typ = wrid.Type();
+        println!("work request ID is {}", wc.wr_id);
 
-        match typ {
-            WorkRequestType::WriteImm => {
-                println!("WriteImm");
-                //IO_MGR.ProcessRDMAWriteImmFinish(fd, wc.byte_len as _);
-            }
-            WorkRequestType::Recv => {
-                let imm = unsafe { wc.imm_data_invalidated_rkey_union.imm_data };
-                let immData = ImmData(imm);
-                // IO_MGR.ProcessRDMARecvWriteImm(
-                //     fd,
-                //     immData.ReadCount() as _,
-                //     immData.WriteCount() as _,
-                // );
-                println!("Receive Imm");
-            }
+        if wc.wr_id == 456 {
+            println!("Imm is {}", unsafe {
+                wc.imm_data_invalidated_rkey_union.imm_data
+            });
+        } else {
+            println!("Write len is {}", wc.byte_len);
         }
+
+        // let wrid = WorkRequestId(wc.wr_id);
+        // let fd = wrid.Fd();
+        // let typ = wrid.Type();
+
+        // match typ {
+        //     WorkRequestType::WriteImm => {
+        //         println!("WriteImm: write bytes {}", wc.byte_len);
+        //         //IO_MGR.ProcessRDMAWriteImmFinish(fd, wc.byte_len as _);
+        //     }
+        //     WorkRequestType::Recv => {
+        //         let imm = unsafe { wc.imm_data_invalidated_rkey_union.imm_data };
+        //         let immData = ImmData(imm);
+        //         println!("immData read count: {}, write count: {}", immData.ReadCount(), immData.WriteCount());
+        //         // IO_MGR.ProcessRDMARecvWriteImm(
+        //         //     fd,
+        //         //     immData.ReadCount() as _,
+        //         //     immData.WriteCount() as _,
+        //         // );
+        //         println!("Receive Imm");
+        //     }
+        // }
     }
 }
 
@@ -658,6 +777,11 @@ impl QueuePair {
 
         let mut bad_wr: *mut rdmaffi::ibv_recv_wr = ptr::null_mut();
         let rc = unsafe { rdmaffi::ibv_post_recv(self.Data(), &mut rw, &mut bad_wr) };
+
+        println!(
+            "ibv_post_recv failed: last os error: {}",
+            Error::last_os_error()
+        );
 
         rc
     }
@@ -999,7 +1123,7 @@ impl QueuePair {
         rc
     }
 
-    pub fn post_receive(&self, local_address: u64, size: u32, lkey: u32) -> i32 {
+    pub fn post_receive(&self, wr_id: u64, local_address: u64, size: u32, lkey: u32) -> i32 {
         let mut sge = rdmaffi::ibv_sge {
             addr: local_address,
             length: size,
@@ -1007,7 +1131,7 @@ impl QueuePair {
         };
 
         let mut rw = rdmaffi::ibv_recv_wr {
-            wr_id: 0,
+            wr_id: wr_id,
             next: ptr::null_mut(),
             sg_list: &mut sge,
             num_sge: 1,
