@@ -514,46 +514,42 @@ impl RDMAContext {
         };
 
         loop {
-            unsafe {
-                println!("1 ibv_get_cq_event ****");
-                //let channel = self.lock().completeChannel.0;
-                println!("2 ibv_get_cq_event ****");
-                //let mut queue = self.CompleteQueue();
-                println!("3 before ibv_get_cq_event ****");
-                let mut cq_ptr: *mut rdmaffi::ibv_cq = ptr::null_mut();
-                let mut cq_context: *mut std::os::raw::c_void = ptr::null_mut();
+            let mut cq_ptr: *mut rdmaffi::ibv_cq = ptr::null_mut();
+            let mut cq_context: *mut std::os::raw::c_void = ptr::null_mut();
+            let mut ret = unsafe {
                 rdmaffi::ibv_get_cq_event(
                     self.CompleteChannel(),
                     &mut cq_ptr, //&mut self.CompleteQueue(),
                     &mut cq_context,
-                );
-                println!("4 before ibv_get_cq_event ****");
-            }
-            let poll_result = unsafe { rdmaffi::ibv_poll_cq(self.CompleteQueue(), 1, &mut wc) };
-            if poll_result > 0 {
-                println!("Got WC {}!", wc.wr_id);
-                unsafe {
-                    rdmaffi::ibv_req_notify_cq(
-                        self.CompleteQueue(), /* on which CQ */
-                        0,                    /* 0 = all event type, no filter*/
-                    );
-                }
-                unsafe {
-                    rdmaffi::ibv_ack_cq_events(
-                        self.CompleteQueue(), /* on which CQ */
-                        1,                    /* 0 = all event type, no filter*/
-                    );
-                }
-                self.ProcessWC(&wc);
+                )
+            };
+            if ret == -1 {
                 break;
-            } else if poll_result == 0 {
-                println!("No WC!");
-                let sleep_duration = Duration::from_secs(1);
-                thread::sleep(sleep_duration);
-                // break;
-            } else {
-                println!("Error to query CQ!")
-                // break;
+            }
+            println!("get completion event ****");
+            //TODO: potnetial improvemnt to ack in batch
+            unsafe { rdmaffi::ibv_ack_cq_events(cq_ptr, 1) };
+
+            ret = unsafe { rdmaffi::ibv_req_notify_cq(cq_ptr, 0) };
+            if ret != 0 {
+                // TODO: should keep call here?
+                println!("Couldn't request CQ notification\n");
+            }
+
+            loop {
+                let poll_result = unsafe { rdmaffi::ibv_poll_cq(self.CompleteQueue(), 1, &mut wc) };
+                if poll_result > 0 {
+                    println!("Got WC {}!", wc.wr_id);
+                    self.ProcessWC(&wc);
+                } else if poll_result == 0 {
+                    println!("No WC!");
+                    let sleep_duration = Duration::from_secs(1);
+                    thread::sleep(sleep_duration);
+                    break;
+                } else {
+                    println!("Error to query CQ!")
+                    // break;
+                }
             }
         }
         1
@@ -618,14 +614,13 @@ impl RDMAContext {
     // call back for
     pub fn ProcessWC(&self, wc: &rdmaffi::ibv_wc) {
         println!("work request ID is {}", wc.wr_id);
+        println!("opcode is {}", wc.opcode);
 
-        if wc.wr_id == 456 {
-            println!("Imm is {}", unsafe {
-                wc.imm_data_invalidated_rkey_union.imm_data
-            });
-        } else {
-            println!("Write len is {}", wc.byte_len);
-        }
+        println!("Imm is {}", unsafe {
+            wc.imm_data_invalidated_rkey_union.imm_data
+        });
+
+        println!("Byte len is {}", wc.byte_len);
 
         // let wrid = WorkRequestId(wc.wr_id);
         // let fd = wrid.Fd();
